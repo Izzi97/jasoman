@@ -2,49 +2,71 @@
 #define JASOMAN_IMPL
 #include "jasoman.h"
 
+void indent(size_t i) {
+	for (; i > 0; i--) putchar('\t');
+}
+
+void print_value(value_t *v, size_t i, bool from_object) {
+	if (!from_object) indent(i);
+	switch (v->type) {
+		case VT_NULL:
+			printf("null");
+			break;
+		case VT_BOOLEAN:
+		     	printf("%s", v->data.boolean ? "true" : "false");
+			break;
+		case VT_NUMBER:
+			printf("%f", v->data.number);
+			break;
+		case VT_STRING:
+			printf("%s", v->data.string);
+			break;
+		case VT_ARRAY:
+			putchar('[');
+			for (
+				array_element_t *ae = v->data.array->first;
+				ae != NULL;
+				ae = ae->next
+			) {
+				putchar('\n');
+				indent(i);
+				print_value(ae->value, i+1, false);
+			}
+			putchar('\n');
+			indent(i);
+			putchar(']');
+			break;
+		case VT_OBJECT:
+			putchar('{');
+			for (
+				object_element_t *oe = v->data.object->first;
+				oe != NULL;
+				oe = oe->next
+			) {
+				putchar('\n');
+				indent(i+1);
+				printf("%s: ", oe->key);
+				print_value(oe->value, i+1, true);
+			}
+			putchar('\n');
+			indent(i);
+			putchar('}');
+			break;
+		default:
+			panic("invlid value type");
+	}
+}
+
 int main() {
-	char input[] = "   {	\"foo\": -42.69e3,\n\"bar\": [ null, true, false ]}";
-	size_t pos = 0, cap = sizeof(input)-1; // ignore trailing null byte
-	tokenizer_result_t tr;
+	char *input = "   {	\"foo\": -42.69e3,\n\"bar\": [ null, true, false ], \"baz\":{}, \"fred\": []}";
 	
-	while ((tr = next_token(input, pos, cap)).status == SUCCESS) {
-		switch (tr.token.type) {
-			case TT_BOOLEAN: {
-				printf("%s\n", tr.token.value.boolean ? "true" : "false");
-				break;
-			}
-			case TT_NUMBER: {
-				printf("%f\n", tr.token.value.number);
-				break;
-			}
-			case TT_STRING: {
-				printf("\"%s\"\n", tr.token.value.string);
-				break;
-			}
-			default: printf("%s\n", tt_name(tr.token.type));
-		}
-		pos = tr.position;
-	}
+	parser_result_t pr = parse(input);
+	if (pr.status == FAILURE)
+		fprintf(stderr, "failed @%ld: %s", pr.position, pr.reason);
+	else
+		print_value(pr.value, 0, false);
 
-	switch (tr.status) {
-		case SUCCESS: {
-			printf("success\n");
-			break;
-		}
-		case FAILURE: {
-			printf("failure: %s\n", tr.reason);
-			break;
-		}
-		case EOI: {
-			printf("eoi@%ld", tr.position);
-			break;
-		}
-		default: {
-			printf("invalid result status: %d", tr.status);
-			break;
-		}
-	}
-
+	v_free(pr.value);
 	return 0;
 }
 

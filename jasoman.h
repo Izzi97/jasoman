@@ -1,6 +1,36 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
+
+#define STACK_INIT_CAP 64
+
+void
+panic(char *reason) {
+	fprintf(stderr, reason);
+	exit(EXIT_FAILURE);
+}
+
+void
+panic_mem() {
+	panic("memory allocation failed");
+}
+
+void*
+safe_malloc(size_t s) {
+	void *p = malloc(s);
+	if (!p) panic_mem();
+	return p;
+}
+#define malloc(s) safe_malloc(s)
+
+void*
+safe_calloc(size_t n, size_t s) {
+	void *p = calloc(n, s);
+	if (!p) panic_mem();
+	return p;
+}
+#define calloc(n, s) safe_calloc(n, s)
 
 typedef enum {
 	FAILURE,
@@ -45,7 +75,177 @@ typedef struct {
 char * tt_name(token_type_t tt);
 tokenizer_result_t next_token(char *input, size_t pos, size_t cap);
 
+
+
+typedef enum {
+	VT_NULL,
+	VT_BOOLEAN,
+	VT_NUMBER,
+	VT_STRING,
+	VT_ARRAY,
+	VT_OBJECT,
+	VT_COUNT
+} value_type_t;
+
+typedef struct array array_t;
+typedef struct object object_t;
+
+typedef struct {
+	value_type_t type;
+	union {
+		bool 		boolean;
+		double 		number;
+		char 		*string;
+		array_t 	*array;
+		object_t 	*object;
+	} data;
+} value_t;
+
+typedef struct array_element array_element_t;
+typedef struct array_element {
+	array_element_t *next;
+	value_t *value;
+} array_element_t;
+
+typedef struct array {
+	array_element_t *first;
+	array_element_t *last;
+} array_t;
+
+typedef struct object_element object_element_t;
+typedef struct object_element {
+	object_element_t *next;
+	char *key;
+	value_t *value;
+} object_element_t;
+
+typedef struct object {
+	object_element_t *first;
+	object_element_t *last;
+} object_t;
+
+value_t*
+value_new(value_type_t t) {
+	value_t *v = malloc(sizeof(value_t));
+	if (!v) panic_mem();
+	v->type = t;
+	return v;
+}
+
+value_t*
+v_null_new() {
+	return value_new(VT_NULL);
+}
+
+value_t*
+v_bool_new(bool data) {
+	value_t *v = value_new(VT_BOOLEAN);
+	v->data.boolean = data;
+	return v;
+}
+
+value_t*
+v_number_new(double data) {
+	value_t *v = value_new(VT_NUMBER);
+	v->data.number = data;
+	return v;
+}
+
+value_t*
+v_string_new(char *data) {
+	value_t *v = value_new(VT_STRING);
+	v->data.string = data;
+	return v;
+}
+
+value_t*
+v_array_new() {
+	value_t *v = value_new(VT_ARRAY);
+	v->data.array = calloc(1, sizeof(array_t));
+	if (!v->data.array) panic_mem();
+	return v;
+}
+
+void
+v_array_append(array_t *a, value_t *v) {
+	if (!a || !v) return;
+
+	array_element_t *ae = calloc(1, sizeof(array_element_t));
+	ae->value = v;
+
+	if (!a->last) a->first = a->last = ae;
+	else a->last = a->last->next = ae;
+}
+
+value_t*
+v_object_new() {
+	value_t *v = value_new(VT_OBJECT);
+	v->data.object = calloc(1, sizeof(object_t));
+	if (!v->data.object) panic_mem();
+	return v;
+}
+
+void
+v_object_append(object_t *o) {
+	if (!o) return;
+
+	object_element_t *oe = calloc(1, sizeof(object_element_t));
+	if (!o->last) o->first = o->last = oe;
+	else o->last = o->last->next = oe;
+}
+
+void
+v_free(value_t *v) {
+	if (!v) return;
+	switch (v->type) {
+		case VT_STRING:
+			free(v->data.string);
+			break;
+		case VT_ARRAY:
+			array_t *a = v->data.array;
+			array_element_t *ae_cur = a->first, *ae_next;
+			while (ae_cur) {
+				ae_next = ae_cur->next;
+				v_free(ae_cur->value);
+				free(ae_cur);
+				ae_cur = ae_next;
+			}
+			free(a);
+			break;
+		case VT_OBJECT:
+			object_t *o = v->data.object;
+			object_element_t *oe_cur = o->first, *oe_next;
+			while (oe_cur)  {
+				oe_next = oe_cur->next;
+				v_free(oe_cur->value);
+				free(oe_cur);
+				oe_cur = oe_next;
+			}
+			free(o);
+			break;
+		default:
+	}
+	free(v);
+}
+
+
+
+typedef struct {
+	status_t status;
+	size_t position;
+	union {
+		value_t *value;
+		char *reason;
+	};
+} parser_result_t;
+
+parser_result_t parse(char *input);
+
+
+
 #ifdef JASOMAN_IMPL
+
+// Tokenizer
 
 char *
 tt_name(token_type_t tt) {
@@ -319,6 +519,500 @@ next_token(char *input, size_t pos, size_t cap) {
 
 	return res;
 }
+
+
+// Parser
+
+typedef enum {
+	S_INIT,
+	S_ARR_OPEN,
+	S_ARR_ITEM,
+	S_ARR_COMMA,
+	S_ARR_CLOSE,
+	S_OBJ_OPEN,
+	S_OBJ_KVP_LHS,
+	S_OBJ_KVP_COLON,
+	S_OBJ_KVP_RHS,
+	S_OBJ_COMMA,
+	S_OBJ_CLOSE,
+	S_COUNT
+} state_t;
+
+typedef struct {
+	state_t *data;
+	size_t capacity;
+	size_t count;
+} state_stack_t;
+
+state_stack_t
+ss_new() {
+	state_t *data = malloc(STACK_INIT_CAP * sizeof(state_t));
+	if (!data) panic_mem();
+
+	state_stack_t ss = {0};
+	ss.data = data;
+	ss.capacity = STACK_INIT_CAP;
+	return ss;
+}
+
+state_t*
+ss_peek(state_stack_t *ss) {
+	if (!ss->count) return NULL;
+	else return &(ss->data[ss->count-1]);
+}
+
+void
+ss_push(state_stack_t *ss, state_t s){
+	if (ss->count == ss->capacity) {
+		state_t *bigger_data = realloc(ss->data, 2 * ss->capacity * sizeof(state_t));
+		if (!bigger_data) panic_mem();
+		ss->data = bigger_data;
+	}
+
+	ss->data[ss->count++] = s;
+}
+
+void
+ss_pop(state_stack_t *ss) {
+	if (ss->count == 0) return;
+	else ss->count -= 1;
+}
+
+void
+ss_free(state_stack_t *ss) {
+	free(ss->data);
+}
+
+typedef struct {
+	value_t **data;
+	size_t count;
+	size_t capacity;
+} value_stack_t;
+
+value_stack_t
+vs_new() {
+	value_t **data = malloc(STACK_INIT_CAP * sizeof(value_t*));
+	if (!data) panic_mem();
+
+	value_stack_t vs = {0};
+	vs.data = data;
+	vs.capacity = STACK_INIT_CAP;
+	return vs;
+}
+
+value_t*
+vs_peek(value_stack_t *vs) {
+	if (!vs->count) return NULL;
+	else return vs->data[vs->count-1];
+}
+
+void
+vs_push(value_stack_t *vs, value_t *s){
+	if (vs->count == vs->capacity) {
+		value_t **bigger_data = realloc(vs->data, 2 * vs->capacity * sizeof(value_t*));
+		if (!bigger_data) panic_mem();
+		vs->data = bigger_data;
+	}
+
+	vs->data[vs->count++] = s;
+}
+
+void
+vs_pop(value_stack_t *vs) {
+	if (vs->count == 0) return;
+	else vs->count -= 1;
+}
+
+void
+vs_free(value_stack_t *vs) {
+	free(vs->data);
+}
+
+
+parser_result_t
+p_res_succ(value_t *v) {
+	return (parser_result_t){
+		.status = SUCCESS,
+		.value = v
+	};
+}
+
+typedef parser_result_t (*handler_t)(token_t t, state_stack_t *ss, value_stack_t *vs);
+
+parser_result_t
+invalid_transition(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void) t;
+	(void) ss;
+	(void) vs;
+	return (parser_result_t) {
+		.status = FAILURE,
+		.reason = "unexpected token"
+	};
+}
+
+parser_result_t
+h_toplevel_null(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_pop(ss);
+
+	value_t *v = v_null_new();
+	vs_push(vs, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_toplevel_bool(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	ss_pop(ss);
+
+	value_t *v = v_bool_new(t.value.boolean);
+	vs_push(vs, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_toplevel_number(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	ss_pop(ss);
+
+	value_t *v = v_number_new(t.value.number);
+	vs_push(vs, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_toplevel_string(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	ss_pop(ss);
+
+	value_t *v = v_string_new(t.value.string);
+	vs_push(vs, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_toplevel_array(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_pop(ss);
+	ss_push(ss, S_ARR_OPEN);
+
+	value_t *v = v_array_new();
+	vs_push(vs, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_toplevel_object(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_pop(ss);
+	ss_push(ss, S_OBJ_OPEN);
+
+	value_t *v = v_object_new();
+	vs_push(vs, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_composite_close(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_pop(ss);
+	state_t *s = ss_peek(ss);
+	if (!s) return p_res_succ(vs_peek(vs));
+
+	value_t *v;
+	switch (*s) {
+		case S_ARR_COMMA:
+			ss_pop(ss);
+			ss_push(ss, S_ARR_ITEM);
+			v = vs_peek(vs);
+			vs_pop(vs);
+			value_t *va = vs_peek(vs);
+			v_array_append(va->data.array, v);
+			return p_res_succ(v);
+		case S_OBJ_KVP_COLON:
+			ss_pop(ss);
+			ss_push(ss, S_OBJ_KVP_RHS);
+			v = vs_peek(vs);
+			vs_pop(vs);
+			value_t *vo = vs_peek(vs);
+			vo->data.object->last->value = v;
+			return p_res_succ(v);
+		default:
+			return (parser_result_t){
+				.status = FAILURE,
+				.reason = "unexpected state"
+			};
+	}
+}
+
+parser_result_t
+h_arrappend_null(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_pop(ss);
+	ss_push(ss, S_ARR_ITEM);
+
+	value_t *v = v_null_new();
+	array_t *a = vs_peek(vs)->data.array;
+	v_array_append(a, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_arrappend_boolean(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	ss_pop(ss);
+	ss_push(ss, S_ARR_ITEM);
+
+	value_t *v = v_bool_new(t.value.boolean);
+	array_t *a = vs_peek(vs)->data.array;
+	v_array_append(a, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_arrappend_number(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	ss_pop(ss);
+	ss_push(ss, S_ARR_ITEM);
+
+	value_t *v = v_number_new(t.value.number);
+	array_t *a = vs_peek(vs)->data.array;
+	v_array_append(a, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_arrappend_string(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	ss_pop(ss);
+	ss_push(ss, S_ARR_ITEM);
+
+	value_t *v = v_string_new(t.value.string);
+	array_t *a = vs_peek(vs)->data.array;
+	v_array_append(a, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_arrappend_arrstart(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_pop(ss);
+	ss_push(ss, S_ARR_ITEM);
+	ss_push(ss, S_ARR_OPEN);
+
+	value_t *v = v_array_new();
+	array_t *a = vs_peek(vs)->data.array;
+	v_array_append(a, v);
+	vs_push(vs, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_arrappend_objstart(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_pop(ss);
+	ss_push(ss, S_ARR_ITEM);
+	ss_push(ss, S_OBJ_OPEN);
+
+	value_t *v = v_object_new();
+	array_t *a = vs_peek(vs)->data.array;
+	v_array_append(a, v);
+	vs_push(vs, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_arritem_comma(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_pop(ss);
+	ss_push(ss, S_ARR_COMMA);
+	return p_res_succ(vs_peek(vs));
+}
+
+parser_result_t
+h_kvp_key(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	ss_pop(ss);
+	ss_push(ss, S_OBJ_KVP_LHS);
+	value_t *v = vs_peek(vs);
+	object_t *o = v->data.object;
+	v_object_append(o);
+	o->last->key = t.value.string;
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_kvp_colon(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	(void)vs;
+	ss_pop(ss);
+	ss_push(ss, S_OBJ_KVP_COLON);
+	return p_res_succ(vs_peek(vs));
+}
+
+parser_result_t
+h_kvp_valuenull(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_pop(ss);
+	ss_push(ss, S_OBJ_KVP_RHS);
+	value_t *v = vs_peek(vs);
+	object_t *o = v->data.object;
+	o->last->value = v_null_new();
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_kvp_valueboolean(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	ss_pop(ss);
+	ss_push(ss, S_OBJ_KVP_RHS);
+	value_t *v = vs_peek(vs);
+	object_t *o = v->data.object;
+	o->last->value = v_bool_new(t.value.boolean);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_kvp_valuenumber(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	ss_pop(ss);
+	ss_push(ss, S_OBJ_KVP_RHS);
+	value_t *v = vs_peek(vs);
+	object_t *o = v->data.object;
+	o->last->value = v_number_new(t.value.number);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_kvp_valuestring(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	ss_pop(ss);
+	ss_push(ss, S_OBJ_KVP_RHS);
+	value_t *v = vs_peek(vs);
+	object_t *o = v->data.object;
+	o->last->value = v_string_new(t.value.string);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_kvp_valuearray(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_push(ss, S_ARR_OPEN);
+	value_t *vo = vs_peek(vs);
+	object_t *o = vo->data.object;
+	value_t *va = v_array_new();
+	o->last->value = va;
+	vs_push(vs, va);
+	return p_res_succ(va);
+}
+
+parser_result_t
+h_kvp_valueobject(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_push(ss, S_OBJ_OPEN);
+	value_t *vo = vs_peek(vs);
+	object_t *o = vo->data.object;
+	value_t *v = v_object_new();
+	o->last->value = v;
+	vs_push(vs, v);
+	return p_res_succ(v);
+}
+
+parser_result_t
+h_object_comma(token_t t, state_stack_t *ss, value_stack_t *vs) {
+	(void)t;
+	ss_pop(ss);
+	ss_push(ss, S_OBJ_COMMA);
+	return p_res_succ(vs_peek(vs));
+}
+
+static handler_t parse_table[S_COUNT][TT_COUNT];
+static bool parse_table_initialized = false;
+
+void
+init_parse_table() {
+	if (parse_table_initialized) return;
+
+	for (size_t i = 0; i < S_COUNT; i++) {
+		for (size_t j = 0; j < TT_COUNT; j++)
+			parse_table[i][j] = invalid_transition;
+	}
+
+	parse_table[S_INIT][TT_NULL] = h_toplevel_null;
+	parse_table[S_INIT][TT_BOOLEAN] = h_toplevel_bool;
+	parse_table[S_INIT][TT_NUMBER] = h_toplevel_number;
+	parse_table[S_INIT][TT_STRING] = h_toplevel_string;
+	parse_table[S_INIT][TT_ARRAY_START] = h_toplevel_array;
+	parse_table[S_INIT][TT_OBJECT_START] = h_toplevel_object;
+
+	parse_table[S_ARR_OPEN][TT_ARRAY_END] = h_composite_close;
+	parse_table[S_ARR_OPEN][TT_NULL] = h_arrappend_null;
+	parse_table[S_ARR_OPEN][TT_BOOLEAN] = h_arrappend_boolean;
+	parse_table[S_ARR_OPEN][TT_NUMBER] = h_arrappend_number;
+	parse_table[S_ARR_OPEN][TT_STRING] = h_arrappend_string;
+	parse_table[S_ARR_OPEN][TT_ARRAY_START] = h_arrappend_arrstart;
+	parse_table[S_ARR_OPEN][TT_OBJECT_START] = h_arrappend_objstart;
+
+	parse_table[S_ARR_ITEM][TT_ARRAY_END] = h_composite_close;
+	parse_table[S_ARR_ITEM][TT_COMMA] = h_arritem_comma;
+
+	parse_table[S_ARR_COMMA][TT_NULL] = h_arrappend_null;
+	parse_table[S_ARR_COMMA][TT_BOOLEAN] = h_arrappend_boolean;
+	parse_table[S_ARR_COMMA][TT_NUMBER] = h_arrappend_number;
+	parse_table[S_ARR_COMMA][TT_STRING] = h_arrappend_string;
+	parse_table[S_ARR_COMMA][TT_ARRAY_START] = h_arrappend_arrstart;
+	parse_table[S_ARR_COMMA][TT_OBJECT_START] = h_arrappend_objstart;
+
+	parse_table[S_OBJ_OPEN][TT_OBJECT_END] = h_composite_close;
+	parse_table[S_OBJ_OPEN][TT_STRING] = h_kvp_key;
+
+	parse_table[S_OBJ_KVP_LHS][TT_COLON] = h_kvp_colon;
+
+	parse_table[S_OBJ_KVP_COLON][TT_NULL] = h_kvp_valuenull;
+	parse_table[S_OBJ_KVP_COLON][TT_BOOLEAN] = h_kvp_valueboolean;
+	parse_table[S_OBJ_KVP_COLON][TT_NUMBER] = h_kvp_valuenumber;
+	parse_table[S_OBJ_KVP_COLON][TT_STRING] = h_kvp_valuestring;
+	parse_table[S_OBJ_KVP_COLON][TT_ARRAY_START] = h_kvp_valuearray;
+	parse_table[S_OBJ_KVP_COLON][TT_OBJECT_START] = h_kvp_valueobject;
+
+	parse_table[S_OBJ_KVP_RHS][TT_OBJECT_END] = h_composite_close;
+	parse_table[S_OBJ_KVP_RHS][TT_COMMA] = h_object_comma;
+
+	parse_table[S_OBJ_COMMA][TT_STRING] = h_kvp_key;
+}
+
+parser_result_t
+parse(char *input) {
+	size_t cap = strlen(input);
+	tokenizer_result_t tr = {0};
+
+	state_stack_t ss = ss_new();
+	ss_push(&ss, S_INIT);
+	value_stack_t vs = vs_new();
+	state_t s;
+	handler_t h;
+	parser_result_t pr = {0};
+
+	init_parse_table();
+
+	do {
+		tr = next_token(input, tr.position, cap);
+		switch (tr.status) {
+			case SUCCESS:
+				s = *ss_peek(&ss);
+				h = parse_table[s][tr.token.type];
+				pr = (*h)(tr.token, &ss, &vs);
+				break;
+			case EOI:
+				pr.status = EOI;
+				break;
+			case FAILURE:
+				pr.status = FAILURE;
+				pr.reason = tr.reason;
+				break;
+			default:
+				panic("invalid state reached");
+		}
+		pr.position = tr.position;
+	} while (ss_peek(&ss) && pr.status == SUCCESS);
+
+	if (ss_peek(&ss) && pr.status == EOI) {
+		pr.status = FAILURE;
+		pr.reason = "unexpected end of input";
+	}
+	return pr;
+}
+
 
 #endif
 
